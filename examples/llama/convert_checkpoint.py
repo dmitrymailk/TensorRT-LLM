@@ -329,9 +329,9 @@ def preload_model(model_dir, load_model_on_cpu):
         use_safetensors = False
         from transformers import LlavaForConditionalGeneration
         model_cls = LlavaForConditionalGeneration
-    use_safetensors = any(
-        [f.endswith(".safetensors")
-         for f in os.listdir(model_dir)]) and use_safetensors
+    # use_safetensors = any(
+    #     [f.endswith(".safetensors")
+    #      for f in os.listdir(model_dir)]) and use_safetensors
     if use_safetensors:
         return None
     model = model_cls.from_pretrained(
