@@ -1,7 +1,8 @@
 # Inferencing w/ single GPU greedy search, compare results with HuggingFace FP32
 export MODEL_NAME=google-t5/t5-small 
 export MODEL_TYPE="t5"
-export INFERENCE_PRECISION="bfloat16"
+# export INFERENCE_PRECISION="bfloat16"
+export INFERENCE_PRECISION="int8"
 export TP_SIZE=1
 export PP_SIZE=1
 export WORLD_SIZE=1

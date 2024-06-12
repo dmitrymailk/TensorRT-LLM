@@ -7,10 +7,7 @@ import torch  # pytype: disable=import-error
 from tensorrt_llm._utils import str_dtype_to_torch
 
 
-def split(v: Union[np.ndarray, torch.Tensor],
-          tp_size: int,
-          tp_rank: int,
-          dim=0):
+def split(v: Union[np.ndarray, torch.Tensor], tp_size: int, tp_rank: int, dim=0):
     if tp_size == 1:
         if isinstance(v, np.ndarray):
             return np.ascontiguousarray(v.copy())
@@ -18,11 +15,11 @@ def split(v: Union[np.ndarray, torch.Tensor],
             return v.clone().detach()
     assert len(v.shape) > 1 or dim == 0
     if isinstance(v, np.ndarray):
-        return np.ascontiguousarray(
-            np.split(v, tp_size, axis=dim)[tp_rank].copy())
+        return np.ascontiguousarray(np.split(v, tp_size, axis=dim)[tp_rank].copy())
     else:
-        assert v.shape[dim] % tp_size == 0, \
-            'Unable to split: shape={v.shape} (dim={dim}) tp_size={tp_size}.'
+        assert (
+            v.shape[dim] % tp_size == 0
+        ), "Unable to split: shape={v.shape} (dim={dim}) tp_size={tp_size}."
         split_size = v.shape[dim] // tp_size
         return v.split(split_size, dim=dim)[tp_rank].clone().detach()
 
@@ -34,12 +31,35 @@ def reshape(v: torch.Tensor, shape=None):
         return v.reshape(shape).contiguous()
 
 
-def fuse_qkv_one_layer(params, attn_module_name, trtllm_layer_name, tp_size,
-                       tp_rank, model_type, weight_shape, bias_shape):
+def fuse_qkv_one_layer(
+    params,
+    attn_module_name,
+    trtllm_layer_name,
+    tp_size,
+    tp_rank,
+    model_type,
+    weight_shape,
+    bias_shape,
+):
 
     qkv_module_names = get_qkv_module_name(model_type)
 
     weight = {}
+
+    {
+        "encoder_layers.4.attention.qkv.weights_scaling_factor",
+        "encoder_layers.5.attention.qkv.prequant_scaling_factor",
+        "encoder_layers.2.attention.qkv.prequant_scaling_factor",
+        "encoder_layers.1.attention.qkv.prequant_scaling_factor",
+        "encoder_layers.4.attention.qkv.prequant_scaling_factor",
+        "encoder_layers.5.attention.qkv.weights_scaling_factor",
+        "encoder_layers.2.attention.qkv.weights_scaling_factor",
+        "encoder_layers.0.attention.qkv.weights_scaling_factor",
+        "encoder_layers.3.attention.qkv.prequant_scaling_factor",
+        "encoder_layers.3.attention.qkv.weights_scaling_factor",
+        "encoder_layers.1.attention.qkv.weights_scaling_factor",
+        "encoder_layers.0.attention.qkv.prequant_scaling_factor",
+    }
 
     # fuse weights of q, k, v
     q_w = params[f'{attn_module_name}.{qkv_module_names["q"]}.weight']
@@ -48,23 +68,61 @@ def fuse_qkv_one_layer(params, attn_module_name, trtllm_layer_name, tp_size,
 
     # fuse qkv weight
     shape = q_w.shape  # (do, din)
-    qkv_w = torch.cat([q_w, k_w, v_w],
-                      dim=0).reshape([3, shape[0], shape[1]])  # (3, do, din)
+    qkv_w = torch.cat([q_w, k_w, v_w], dim=0).reshape(
+        [3, shape[0], shape[1]]
+    )  # (3, do, din)
     qkv_w = split(qkv_w, tp_size, tp_rank, dim=1)
-    weight[f'{trtllm_layer_name}.qkv.weight'] = reshape(qkv_w,
-                                                        shape=weight_shape)
+    weight[f"{trtllm_layer_name}.qkv.weight"] = reshape(qkv_w, shape=weight_shape)
+
+    if (
+        not params.get(
+            f'{attn_module_name}.{qkv_module_names["k"]}.weight_quantizer._amax', None
+        )
+        is None
+    ):
+        pre_scale_q = params[
+            f'{attn_module_name}.{qkv_module_names["q"]}.input_quantizer._pre_quant_scale'
+        ]
+        pre_scale_k = params[
+            f'{attn_module_name}.{qkv_module_names["k"]}.input_quantizer._pre_quant_scale'
+        ]
+        pre_scale_v = params[
+            f'{attn_module_name}.{qkv_module_names["v"]}.input_quantizer._pre_quant_scale'
+        ]
+
+        scale_q = params[
+            f'{attn_module_name}.{qkv_module_names["q"]}.weight_quantizer._amax'
+        ]
+        scale_k = params[
+            f'{attn_module_name}.{qkv_module_names["k"]}.weight_quantizer._amax'
+        ]
+        scale_v = params[
+            f'{attn_module_name}.{qkv_module_names["v"]}.weight_quantizer._amax'
+        ]
+        weight[f"{trtllm_layer_name}.qkv.weights_scaling_factor"] = (
+            scale_q + scale_k + scale_v
+        ) / 3
+        weight[f"{trtllm_layer_name}.qkv.prequant_scaling_factor"] = torch.cat(
+            [
+                pre_scale_q,
+                pre_scale_k,
+                pre_scale_v,
+            ],
+            dim=0,
+        ).unsqueeze(0)
 
     # fuse qkv biases if present
-    if f'{attn_module_name}.{qkv_module_names["q"]}.bias' in params.keys(
-    ) and params[f'{attn_module_name}.{qkv_module_names["q"]}.bias'] is not None:
+    if (
+        f'{attn_module_name}.{qkv_module_names["q"]}.bias' in params.keys()
+        and params[f'{attn_module_name}.{qkv_module_names["q"]}.bias'] is not None
+    ):
         q_b = params[f'{attn_module_name}.{qkv_module_names["q"]}.bias']
         k_b = params[f'{attn_module_name}.{qkv_module_names["k"]}.bias']
         v_b = params[f'{attn_module_name}.{qkv_module_names["v"]}.bias']
         shape = q_b.shape[0]  # (do,)
         qkv_b = torch.cat([q_b, k_b, v_b], dim=0).reshape([3, shape])  # (3, do)
         qkv_b = split(qkv_b, tp_size, tp_rank, dim=1)
-        weight[f'{trtllm_layer_name}.qkv.bias'] = reshape(qkv_b,
-                                                          shape=bias_shape)
+        weight[f"{trtllm_layer_name}.qkv.bias"] = reshape(qkv_b, shape=bias_shape)
     return weight
 
 
@@ -84,10 +142,10 @@ def get_qkv_module_name(model_type):
     return {"q": q, "k": k, "v": v}
 
 
-def convert_weight_to_dtype(params: typing.Dict[str, torch.Tensor],
-                            dtype: typing.Optional[np.dtype] = None):
+def convert_weight_to_dtype(
+    params: typing.Dict[str, torch.Tensor], dtype: typing.Optional[np.dtype] = None
+):
     if dtype is not None:
-        assert isinstance(dtype,
-                          str), f"dtype must be str, but get type {type(dtype)}"
+        assert isinstance(dtype, str), f"dtype must be str, but get type {type(dtype)}"
         for name in params.keys():
             params[name] = params[name].to(str_dtype_to_torch(dtype))
